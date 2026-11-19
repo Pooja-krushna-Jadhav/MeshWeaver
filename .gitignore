@@ -218,3 +218,59 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# =====================================================================
+# MeshWeaver Custom Ignores: Secrets, Databases, State & Scratch
+# =====================================================================
+
+# Scratch, local notes, and private documents
+scratch/
+scratch*/
+
+# SQLite Databases, WAL files, and ephemeral runtime storage
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+data/
+node_data/
+meshweaver_data/
+*.rdb
+
+# TLS Certificates, Private Keys, and Secrets
+*.pem
+*.key
+*.crt
+*.cert
+*.pfx
+*.p12
+*.csr
+*.ca-bundle
+.env
+.env.*
+!.env.example
+
+# Logs and debug output
+*.log
+logs/
+*.out
+
+# IDEs and Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.sublime-project
+*.sublime-workspace
+
+# Operating System Files
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+
