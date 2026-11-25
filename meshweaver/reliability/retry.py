@@ -33,8 +33,9 @@ class RetryPolicy:
 class DeduplicationRegistry:
     """Tracks recently processed task IDs to prevent duplicate execution (idempotency)."""
 
-    def __init__(self, ttl_sec: float = 3600.0) -> None:
+    def __init__(self, ttl_sec: float = 3600.0, max_entries: int = 10000) -> None:
         self.ttl_sec = ttl_sec
+        self.max_entries = max_entries
         # task_id -> (result_dict, completed_at)
         self._cache: dict[str, tuple[dict[str, Any] | None, float]] = {}
 
@@ -49,13 +50,22 @@ class DeduplicationRegistry:
         if task_id in self._cache:
             return False
         self._cache[task_id] = (None, utc_now())
+        self._cleanup()
         return True
+
+    def clear_started(self, task_id: str) -> None:
+        """Remove an in-flight entry if execution aborted before completion."""
+        entry = self._cache.get(task_id)
+        if entry is not None and entry[0] is None:
+            del self._cache[task_id]
 
     def record_completed(self, task_id: str, result_dict: dict[str, Any]) -> None:
         """Cache completed task result for idempotency reconciliation."""
         self._cache[task_id] = (result_dict, utc_now())
+        self._cleanup()
 
     def get_result(self, task_id: str) -> dict[str, Any] | None:
+        self._cleanup()
         val = self._cache.get(task_id)
         return val[0] if val else None
 
@@ -64,3 +74,11 @@ class DeduplicationRegistry:
         expired = [tid for tid, (_, t) in self._cache.items() if now - t > self.ttl_sec]
         for tid in expired:
             del self._cache[tid]
+
+        if self.max_entries <= 0:
+            self._cache.clear()
+        elif len(self._cache) > self.max_entries:
+            overflow = len(self._cache) - self.max_entries
+            oldest = sorted(self._cache.items(), key=lambda item: item[1][1])[:overflow]
+            for tid, _ in oldest:
+                del self._cache[tid]
