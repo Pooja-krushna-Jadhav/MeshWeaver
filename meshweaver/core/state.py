@@ -1,8 +1,7 @@
 """State definitions and models for MeshWeaver nodes and peers."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from enum import Enum
-import time
 from typing import Any
 from meshweaver.utils.helpers import utc_now
 
@@ -54,7 +53,8 @@ class NodeInfo:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "NodeInfo":
-        return cls(**data)
+        valid_keys = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in data.items() if k in valid_keys})
 
 
 @dataclass
@@ -88,7 +88,8 @@ class ResourceMetrics:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ResourceMetrics":
-        return cls(**data)
+        valid_keys = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in data.items() if k in valid_keys})
 
 
 @dataclass

@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 import os
 from pathlib import Path
 from typing import Any
+from meshweaver.utils.exceptions import ConfigurationError
 from meshweaver.utils.helpers import generate_node_id
 
 
@@ -79,7 +80,9 @@ class SecurityConfig:
     private_key_path: str | None = None
     public_key_path: str | None = None
     allowed_nodes: list[str] = field(default_factory=list)
+    admin_nodes: list[str] = field(default_factory=list)
     allow_cloudpickle: bool = False  # Disabled by default for defense against RCE
+    allow_tofu: bool = True
     trusted_public_keys: dict[str, str] = field(default_factory=dict)  # node_id -> public_key_hex
     replay_window_sec: float = 30.0
 
@@ -135,26 +138,68 @@ class NodeConfig:
     @classmethod
     def from_env(cls) -> "NodeConfig":
         """Load configuration with environment variable overrides."""
+        def _parse_bool(val: str) -> bool:
+            return val.strip().lower() in ("1", "true", "yes")
+
+        def _parse_csv(val: str) -> list[str]:
+            return [p.strip() for p in val.split(",") if p.strip()]
+
         cfg = cls()
         if os.getenv("MESHWEAVER_NODE_ID"):
             cfg.node_id = os.environ["MESHWEAVER_NODE_ID"]
-        if os.getenv("MESHWEAVER_NAME"):
-            cfg.name = os.environ["MESHWEAVER_NAME"]
+        name_val = os.getenv("MESHWEAVER_NAME") or os.getenv("MESHWEAVER_NODE_NAME")
+        if name_val:
+            cfg.name = name_val
         if os.getenv("MESHWEAVER_HOST"):
             cfg.network.host = os.environ["MESHWEAVER_HOST"]
         if os.getenv("MESHWEAVER_TCP_PORT"):
             cfg.network.tcp_port = int(os.environ["MESHWEAVER_TCP_PORT"])
         if os.getenv("MESHWEAVER_UDP_PORT"):
             cfg.network.udp_port = int(os.environ["MESHWEAVER_UDP_PORT"])
+        if os.getenv("MESHWEAVER_TLS_ENABLED"):
+            cfg.network.tls_enabled = _parse_bool(os.environ["MESHWEAVER_TLS_ENABLED"])
+        if os.getenv("MESHWEAVER_TLS_CERT_PATH"):
+            cfg.network.tls_cert_path = os.environ["MESHWEAVER_TLS_CERT_PATH"]
+        if os.getenv("MESHWEAVER_TLS_KEY_PATH"):
+            cfg.network.tls_key_path = os.environ["MESHWEAVER_TLS_KEY_PATH"]
+        if os.getenv("MESHWEAVER_TLS_CA_PATH"):
+            cfg.network.tls_ca_path = os.environ["MESHWEAVER_TLS_CA_PATH"]
         if os.getenv("MESHWEAVER_BOOTSTRAP_PEERS"):
-            cfg.discovery.bootstrap_peers = [
-                p.strip() for p in os.environ["MESHWEAVER_BOOTSTRAP_PEERS"].split(",") if p.strip()
-            ]
-        if os.getenv("MESHWEAVER_SHARED_SECRET"):
-            cfg.security.shared_secret = os.environ["MESHWEAVER_SHARED_SECRET"]
+            cfg.discovery.bootstrap_peers = _parse_csv(os.environ["MESHWEAVER_BOOTSTRAP_PEERS"])
+        secret_val = os.getenv("MESHWEAVER_SHARED_SECRET") or os.getenv("MESHWEAVER_SECRET")
+        if secret_val:
+            cfg.security.shared_secret = secret_val
             cfg.security.enabled = True
+        if os.getenv("MESHWEAVER_REQUIRE_SIGNATURES"):
+            req_sig = _parse_bool(os.environ["MESHWEAVER_REQUIRE_SIGNATURES"])
+            cfg.security.require_signatures = req_sig
+            if req_sig:
+                cfg.security.enabled = True
+        if os.getenv("MESHWEAVER_ALLOW_TOFU"):
+            cfg.security.allow_tofu = _parse_bool(os.environ["MESHWEAVER_ALLOW_TOFU"])
+        if os.getenv("MESHWEAVER_ALLOWED_NODES"):
+            cfg.security.allowed_nodes = _parse_csv(os.environ["MESHWEAVER_ALLOWED_NODES"])
+        if os.getenv("MESHWEAVER_ADMIN_NODES"):
+            cfg.security.admin_nodes = _parse_csv(os.environ["MESHWEAVER_ADMIN_NODES"])
         if os.getenv("MESHWEAVER_ALLOW_CLOUDPICKLE"):
-            cfg.security.allow_cloudpickle = os.environ["MESHWEAVER_ALLOW_CLOUDPICKLE"].lower() in ("1", "true", "yes")
+            cfg.security.allow_cloudpickle = _parse_bool(os.environ["MESHWEAVER_ALLOW_CLOUDPICKLE"])
         if os.getenv("MESHWEAVER_DB_PATH"):
             cfg.storage.db_path = os.environ["MESHWEAVER_DB_PATH"]
+        if os.getenv("MESHWEAVER_LOG_LEVEL"):
+            cfg.monitoring.log_level = os.environ["MESHWEAVER_LOG_LEVEL"].strip().upper()
         return cfg
+
+    def validate(self, require_server_tls: bool = True) -> None:
+        """Validate critical configuration invariants, raising ConfigurationError on invalid settings."""
+        if self.network.tls_enabled:
+            if bool(self.network.tls_cert_path) != bool(self.network.tls_key_path):
+                raise ConfigurationError("Both network.tls_cert_path and network.tls_key_path must be provided together")
+            if require_server_tls and not (self.network.tls_cert_path and self.network.tls_key_path):
+                raise ConfigurationError("TLS enabled on server requires both network.tls_cert_path and network.tls_key_path")
+
+        if (self.security.enabled or self.security.require_signatures) and not self.security.shared_secret:
+            from meshweaver.security import authentication as _auth
+            if not _auth.HAS_CRYPTOGRAPHY:
+                raise ConfigurationError(
+                    "Asymmetric cryptographic security requires the 'cryptography' package when security.shared_secret is unset"
+                )
