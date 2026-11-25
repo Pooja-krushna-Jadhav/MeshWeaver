@@ -3,6 +3,7 @@
 from dataclasses import dataclass, field
 import json
 import logging
+import math
 from typing import Any
 from meshweaver.networking.framing import Frame, FrameFlags, Opcode, encode_frame
 from meshweaver.utils.exceptions import ProtocolError, SerializationError
@@ -38,20 +39,40 @@ class Message:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Message":
+        if not isinstance(data, dict):
+            raise ProtocolError(f"Expected message dict, got {type(data).__name__}")
         try:
-            return cls(
-                sender_id=data["sender_id"],
-                receiver_id=data.get("receiver_id"),
-                msg_type=data["msg_type"],
-                timestamp=data.get("timestamp", utc_now()),
-                nonce=data.get("nonce", generate_nonce()),
-                payload=data.get("payload", {}),
-                signature=data.get("signature"),
-                trace_id=data.get("trace_id"),
-                sender_public_key=data.get("sender_public_key"),
-            )
+            sender_id = data["sender_id"]
+            msg_type = data["msg_type"]
+            timestamp = data["timestamp"]
+            nonce = data["nonce"]
         except KeyError as e:
             raise ProtocolError(f"Missing required message field: {e}") from e
+
+        if not isinstance(sender_id, str) or not sender_id:
+            raise ProtocolError("Invalid or empty 'sender_id' field")
+        if not isinstance(msg_type, str) or not msg_type:
+            raise ProtocolError("Invalid or empty 'msg_type' field")
+        if isinstance(timestamp, bool) or not isinstance(timestamp, (int, float)) or not math.isfinite(timestamp):
+            raise ProtocolError("Invalid 'timestamp' field: expected finite number")
+        if not isinstance(nonce, str) or not nonce:
+            raise ProtocolError("Invalid or empty 'nonce' field")
+
+        payload = data.get("payload", {})
+        if not isinstance(payload, dict):
+            raise ProtocolError("Invalid 'payload' field: expected dict")
+
+        return cls(
+            sender_id=sender_id,
+            receiver_id=data.get("receiver_id"),
+            msg_type=msg_type,
+            timestamp=float(timestamp),
+            nonce=nonce,
+            payload=payload,
+            signature=data.get("signature"),
+            trace_id=data.get("trace_id"),
+            sender_public_key=data.get("sender_public_key"),
+        )
 
     def to_bytes(self) -> bytes:
         """Serialize message to UTF-8 encoded JSON bytes."""
@@ -96,7 +117,12 @@ class Message:
     @classmethod
     def from_frame(cls, frame: Frame) -> "Message":
         """Reconstruct Message from a decoded Frame."""
-        return cls.from_bytes(frame.payload)
+        msg = cls.from_bytes(frame.payload)
+        if msg.opcode() != frame.opcode:
+            raise ProtocolError(
+                f"Frame opcode {frame.opcode.name} does not match message type {msg.msg_type!r}"
+            )
+        return msg
 
     # Factory methods
     @classmethod

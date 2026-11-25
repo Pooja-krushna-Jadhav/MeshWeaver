@@ -2,9 +2,13 @@
 
 import hashlib
 import json
+import re
 import secrets
 import time
 from typing import Any
+from meshweaver.utils.exceptions import ProtocolError, SerializationError
+
+_NODE_ID_RE = re.compile(r"[0-9a-fA-F]{40}")
 
 
 def utc_now() -> float:
@@ -28,8 +32,15 @@ def generate_node_id(seed: str | None = None) -> str:
     return hashlib.sha1(random_bytes).hexdigest()
 
 
+def is_valid_node_id(node_id: str) -> bool:
+    """Return True if node_id is a valid 40-character hexadecimal string."""
+    return isinstance(node_id, str) and bool(_NODE_ID_RE.fullmatch(node_id))
+
+
 def node_id_to_int(node_id: str) -> int:
     """Convert a 40-character hex node ID string to an integer."""
+    if not is_valid_node_id(node_id):
+        raise ProtocolError(f"Invalid node ID (expected 40 hex chars): {node_id!r}")
     return int(node_id, 16)
 
 
@@ -62,7 +73,13 @@ def json_dumps(data: Any) -> str:
 
 def _json_object_hook(obj: dict[str, Any]) -> Any:
     if obj.get("__bytes__") is True and "hex" in obj:
-        return bytes.fromhex(obj["hex"])
+        hex_val = obj["hex"]
+        if not isinstance(hex_val, str):
+            raise SerializationError("Invalid encoded bytes: 'hex' must be a string")
+        try:
+            return bytes.fromhex(hex_val)
+        except ValueError as e:
+            raise SerializationError(f"Invalid hex in encoded bytes: {e}") from e
     return obj
 
 

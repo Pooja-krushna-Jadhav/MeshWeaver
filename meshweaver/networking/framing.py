@@ -56,8 +56,17 @@ class Frame:
     version: int = PROTOCOL_VERSION
 
 
-def encode_frame(opcode: Opcode | int, payload: bytes, flags: int = FrameFlags.NONE) -> bytes:
+def encode_frame(
+    opcode: Opcode | int,
+    payload: bytes,
+    flags: int = FrameFlags.NONE,
+    max_size: int = 16 * 1024 * 1024,
+) -> bytes:
     """Encode an opcode, flags, and payload bytes into a complete wire frame."""
+    if len(payload) > max_size or len(payload) > 0xFFFFFFFF:
+        raise FramingError(
+            f"Frame payload length {len(payload)} exceeds maximum allowed {min(max_size, 0xFFFFFFFF)} bytes"
+        )
     op_val = int(opcode)
     checksum = zlib.crc32(payload) & 0xFFFFFFFF
     header = struct.pack(
@@ -72,20 +81,7 @@ def encode_frame(opcode: Opcode | int, payload: bytes, flags: int = FrameFlags.N
     return header + payload
 
 
-async def read_frame(reader: asyncio.StreamReader, max_size: int = 16 * 1024 * 1024) -> Frame:
-    """Asynchronously read exactly one framed message from an asyncio StreamReader.
-    
-    Raises:
-        asyncio.IncompleteReadError: If socket closes before full frame is read.
-        FramingError: If magic bytes, version, max length, or CRC32 checksum fail.
-    """
-    try:
-        header_data = await reader.readexactly(HEADER_SIZE)
-    except asyncio.IncompleteReadError as e:
-        if len(e.partial) == 0:
-            raise ConnectionResetError("Connection closed by peer") from None
-        raise FramingError(f"Incomplete frame header: received {len(e.partial)}/{HEADER_SIZE} bytes") from e
-
+def _validate_header(header_data: bytes, max_size: int) -> tuple[int, int, int, int, int]:
     magic, version, opcode_val, flags, length, expected_checksum = struct.unpack(HEADER_FORMAT, header_data)
 
     if magic != MAGIC_BYTES:
@@ -97,14 +93,10 @@ async def read_frame(reader: asyncio.StreamReader, max_size: int = 16 * 1024 * 1
     if length > max_size:
         raise FramingError(f"Frame payload length {length} exceeds maximum allowed {max_size} bytes")
 
-    if length > 0:
-        try:
-            payload = await reader.readexactly(length)
-        except asyncio.IncompleteReadError as e:
-            raise FramingError(f"Incomplete payload: received {len(e.partial)}/{length} bytes") from e
-    else:
-        payload = b""
+    return version, opcode_val, flags, length, expected_checksum
 
+
+def _finalize_frame(version: int, opcode_val: int, flags: int, payload: bytes, expected_checksum: int) -> Frame:
     actual_checksum = zlib.crc32(payload) & 0xFFFFFFFF
     if actual_checksum != expected_checksum:
         raise FramingError(
@@ -113,7 +105,47 @@ async def read_frame(reader: asyncio.StreamReader, max_size: int = 16 * 1024 * 1
 
     try:
         opcode = Opcode(opcode_val)
-    except ValueError:
-        opcode = Opcode.ERROR
+    except ValueError as e:
+        raise FramingError(f"Unknown frame opcode: {opcode_val}") from e
 
     return Frame(opcode=opcode, flags=flags, payload=payload, version=version)
+
+
+def decode_frame_bytes(data: bytes, max_size: int = 16 * 1024 * 1024) -> Frame:
+    """Synchronously decode and validate a complete frame from raw bytes."""
+    if len(data) < HEADER_SIZE:
+        raise FramingError(f"Incomplete frame header: received {len(data)}/{HEADER_SIZE} bytes")
+
+    version, opcode_val, flags, length, expected_checksum = _validate_header(data[:HEADER_SIZE], max_size)
+    if len(data) < HEADER_SIZE + length:
+        raise FramingError(f"Incomplete payload: received {len(data) - HEADER_SIZE}/{length} bytes")
+
+    payload = data[HEADER_SIZE : HEADER_SIZE + length]
+    return _finalize_frame(version, opcode_val, flags, payload, expected_checksum)
+
+
+async def read_frame(reader: asyncio.StreamReader, max_size: int = 16 * 1024 * 1024) -> Frame:
+    """Asynchronously read exactly one framed message from an asyncio StreamReader.
+
+    Raises:
+        ConnectionResetError: If the peer closes the connection cleanly before any header bytes arrive.
+        FramingError: If magic bytes, version, max length, completeness, CRC32 checksum, or opcode fail.
+    """
+    try:
+        header_data = await reader.readexactly(HEADER_SIZE)
+    except asyncio.IncompleteReadError as e:
+        if len(e.partial) == 0:
+            raise ConnectionResetError("Connection closed by peer") from None
+        raise FramingError(f"Incomplete frame header: received {len(e.partial)}/{HEADER_SIZE} bytes") from e
+
+    version, opcode_val, flags, length, expected_checksum = _validate_header(header_data, max_size)
+
+    if length > 0:
+        try:
+            payload = await reader.readexactly(length)
+        except asyncio.IncompleteReadError as e:
+            raise FramingError(f"Incomplete payload: received {len(e.partial)}/{length} bytes") from e
+    else:
+        payload = b""
+
+    return _finalize_frame(version, opcode_val, flags, payload, expected_checksum)
