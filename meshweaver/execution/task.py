@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
+import math
 import uuid
 from typing import Any
 from meshweaver.utils.exceptions import ProtocolError
@@ -91,7 +92,9 @@ class Task:
 
     @property
     def is_terminal(self) -> bool:
-        return self.state in (TaskState.COMPLETED, TaskState.CANCELLED)
+        return self.state in (TaskState.COMPLETED, TaskState.CANCELLED) or (
+            self.state == TaskState.FAILED and self.retry_count >= self.max_retries
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -127,3 +130,87 @@ class Task:
         if history:
             task.state_history = history
         return task
+
+    @classmethod
+    def from_network_dict(cls, data: dict[str, Any], max_timeout: float = 300.0) -> "Task":
+        """Construct a sanitized Task from an untrusted network payload."""
+        if not isinstance(data, dict):
+            raise ProtocolError("Task payload must be a dictionary")
+
+        allowed_fields = {
+            "task_id",
+            "name",
+            "payload",
+            "task_type",
+            "origin_node_id",
+            "priority",
+            "timeout",
+            "max_retries",
+        }
+        filtered = {k: data[k] for k in allowed_fields if k in data}
+
+        name = filtered.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise ProtocolError("Task 'name' must be a non-empty string")
+
+        raw_payload = filtered.get("payload")
+        if raw_payload is None:
+            payload: dict[str, Any] = {}
+        elif isinstance(raw_payload, dict):
+            payload = dict(raw_payload)
+            payload.pop("isolate", None)
+        else:
+            raise ProtocolError("Task 'payload' must be a dictionary")
+
+        raw_timeout = filtered.get("timeout", 60.0)
+        if isinstance(raw_timeout, bool):
+            raise ProtocolError("Task 'timeout' must be a positive finite number")
+        try:
+            timeout = float(raw_timeout)
+        except (TypeError, ValueError) as e:
+            raise ProtocolError(f"Invalid task 'timeout': {e}") from e
+        if not math.isfinite(timeout) or timeout <= 0.0:
+            raise ProtocolError("Task 'timeout' must be a positive finite number")
+        if math.isfinite(max_timeout) and max_timeout > 0.0:
+            timeout = min(timeout, max_timeout)
+
+        raw_max_retries = filtered.get("max_retries", 3)
+        if isinstance(raw_max_retries, bool):
+            raise ProtocolError("Task 'max_retries' must be an integer")
+        try:
+            max_retries = max(0, min(10, int(raw_max_retries)))
+        except (TypeError, ValueError) as e:
+            raise ProtocolError(f"Invalid task 'max_retries': {e}") from e
+
+        try:
+            task_type = TaskType(filtered.get("task_type", TaskType.REGISTERED.value))
+            priority = TaskPriority(filtered.get("priority", TaskPriority.NORMAL.value))
+        except (TypeError, ValueError) as e:
+            raise ProtocolError(f"Invalid task metadata field: {e}") from e
+
+        origin_node_id = filtered.get("origin_node_id", "")
+        if not isinstance(origin_node_id, str):
+            raise ProtocolError("Task 'origin_node_id' must be a string")
+
+        task_id = filtered.get("task_id")
+        if task_id is not None and (not isinstance(task_id, str) or not task_id):
+            raise ProtocolError("Task 'task_id' must be a non-empty string")
+
+        kwargs: dict[str, Any] = {
+            "name": name,
+            "payload": payload,
+            "task_type": task_type,
+            "origin_node_id": origin_node_id,
+            "assigned_node_id": None,
+            "priority": priority,
+            "state": TaskState.CREATED,
+            "timeout": timeout,
+            "retry_count": 0,
+            "max_retries": max_retries,
+            "result": None,
+            "error": None,
+        }
+        if task_id is not None:
+            kwargs["task_id"] = task_id
+
+        return cls(**kwargs)
