@@ -1,6 +1,7 @@
 """Distributed Task Scheduler coordinating peer selection and task dispatch."""
 
 import asyncio
+from dataclasses import replace
 import logging
 from typing import Any, Callable, Coroutine
 from meshweaver.core.config import SchedulerConfig
@@ -41,6 +42,19 @@ class TaskScheduler:
         self.config = config or SchedulerConfig()
 
         self.strategy = self._create_strategy(self.config.strategy)
+        self._in_flight_reservations: dict[str, int] = {}
+
+    def reserve_peer(self, node_id: str) -> None:
+        """Optimistically reserve one in-flight task slot on a peer."""
+        self._in_flight_reservations[node_id] = self._in_flight_reservations.get(node_id, 0) + 1
+
+    def release_peer(self, node_id: str) -> None:
+        """Release one optimistic in-flight task slot reservation on a peer."""
+        count = self._in_flight_reservations.get(node_id, 0)
+        if count <= 1:
+            self._in_flight_reservations.pop(node_id, None)
+        else:
+            self._in_flight_reservations[node_id] = count - 1
 
     def _create_strategy(self, strategy_name: str) -> SchedulingStrategy:
         if strategy_name == "least_loaded":
@@ -63,20 +77,41 @@ class TaskScheduler:
             health=PeerHealth.HEALTHY,
         )
 
-    def select_peer_for_task(self, task: Task, active_local_tasks: int = 0) -> tuple[PeerState | None, bool]:
+    def select_peer_for_task(
+        self,
+        task: Task,
+        active_local_tasks: int = 0,
+        excluded_peers: set[str] | None = None,
+    ) -> tuple[PeerState | None, bool]:
         """Select optimal peer to execute task. Returns (selected_peer, is_local)."""
         local_peer = self.get_local_peer_state(active_tasks=active_local_tasks)
 
         # Include local peer plus all known available remote peers
-        candidates: list[PeerState] = [local_peer]
-        candidates.extend(self.peer_table.available_peers())
+        raw_candidates: list[PeerState] = [local_peer]
+        raw_candidates.extend(self.peer_table.available_peers())
 
-        # Filter out duplicates of self in peer table if any
-        candidates = [p for p in candidates if p.info.node_id != self.node_id or p is local_peer]
+        # Filter out duplicates of self and excluded peers
+        raw_candidates = [
+            p for p in raw_candidates
+            if (p.info.node_id != self.node_id or p is local_peer)
+            and (not excluded_peers or p.info.node_id not in excluded_peers)
+        ]
 
-        selected = self.strategy.select_peer(task, candidates, local_peer=local_peer)
+        # Apply optimistic in-flight reservations without mutating shared peer_table state
+        orig_by_id: dict[str, PeerState] = {}
+        adjusted_candidates: list[PeerState] = []
+        for p in raw_candidates:
+            orig_by_id[p.info.node_id] = p
+            reserved = self._in_flight_reservations.get(p.info.node_id, 0)
+            if reserved > 0:
+                adjusted_metrics = replace(p.metrics, active_tasks=p.metrics.active_tasks + reserved)
+                adjusted_candidates.append(replace(p, metrics=adjusted_metrics))
+            else:
+                adjusted_candidates.append(p)
+
+        selected = self.strategy.select_peer(task, adjusted_candidates, local_peer=local_peer)
         if not selected:
             return (None, False)
 
         is_local = (selected.info.node_id == self.node_id)
-        return (selected, is_local)
+        return (orig_by_id[selected.info.node_id], is_local)

@@ -34,6 +34,9 @@ class GossipProtocol:
         stale_threshold: float = 15.0,
         dead_threshold: float = 30.0,
         purge_threshold: float = 90.0,
+        active_tasks_fn: Callable[[], int] | None = None,
+        sign_fn: Callable[[Message], None] | None = None,
+        on_purge_fn: Callable[[str], None] | None = None,
     ) -> None:
         self.node_id = node_id
         self.node_info = node_info
@@ -47,6 +50,9 @@ class GossipProtocol:
         self.stale_threshold = stale_threshold
         self.dead_threshold = dead_threshold
         self.purge_threshold = purge_threshold
+        self.active_tasks_fn = active_tasks_fn
+        self.sign_fn = sign_fn
+        self.on_purge_fn = on_purge_fn
 
         self._is_running = False
         self._gossip_task: asyncio.Task | None = None
@@ -83,6 +89,16 @@ class GossipProtocol:
                 )
                 for dead_id in dead:
                     await self.events.emit(EVENT_PEER_DISCONNECTED, {"node_id": dead_id, "reason": "Dead heartbeat"})
+                for purged_id in purged:
+                    try:
+                        self.kademlia.routing_table.remove_contact(purged_id)
+                    except Exception:
+                        pass
+                    if self.on_purge_fn:
+                        try:
+                            self.on_purge_fn(purged_id)
+                        except Exception:
+                            pass
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -92,20 +108,24 @@ class GossipProtocol:
 
     async def do_gossip_round(self) -> None:
         """Execute one gossip cycle: collect local metrics and send to random peers."""
-        # 1. Sample current local metrics
-        local_metrics = self.resource_monitor.sample()
+        # 1. Sample current local metrics without blocking event loop
+        active_tasks = self.active_tasks_fn() if self.active_tasks_fn else 0
+        local_metrics = await self.resource_monitor.sample_async(active_tasks=active_tasks)
 
         # Update our entry in local peer table
         self.peer_table.update_peer(self.node_info, local_metrics)
 
-        # 2. Gather candidates: all known peers from peer table + Kademlia contacts
+        # 2. Gather candidates: non-dead peers from peer table + Kademlia contacts
         all_candidates: dict[str, tuple[str, int]] = {}
         for p in self.peer_table.all_peers():
-            if p.info.node_id != self.node_id:
+            if p.info.node_id != self.node_id and p.health != PeerHealth.DEAD:
                 all_candidates[p.info.node_id] = (p.info.host, p.info.udp_port)
 
         for c in self.kademlia.routing_table.all_contacts():
             if c.node_id != self.node_id:
+                existing_p = self.peer_table.get(c.node_id)
+                if existing_p and existing_p.health == PeerHealth.DEAD:
+                    continue
                 all_candidates[c.node_id] = (c.host, c.udp_port)
 
         if not all_candidates:
@@ -115,17 +135,26 @@ class GossipProtocol:
         target_ids = list(all_candidates.keys())
         selected_ids = random.sample(target_ids, min(self.fanout, len(target_ids)))
 
-        # 4. Pack peer states to gossip (self + up to 5 other known peers)
+        # 4. Pack peer states to gossip (self + up to 5 other live known peers), capped at 1200B MTU
         peers_to_send: list[dict[str, Any]] = [
             {"info": self.node_info.to_dict(), "metrics": local_metrics.to_dict()}
         ]
-        other_peers = [p for p in self.peer_table.all_peers() if p.info.node_id != self.node_id]
+        other_peers = [
+            p for p in self.peer_table.all_peers()
+            if p.info.node_id != self.node_id and p.health != PeerHealth.DEAD
+        ]
         if other_peers:
             sample_size = min(5, len(other_peers))
             for p in random.sample(other_peers, sample_size):
                 peers_to_send.append({"info": p.info.to_dict(), "metrics": p.metrics.to_dict()})
 
-        gossip_msg = Message.gossip(sender_id=self.node_id, peer_states=peers_to_send)
+        while True:
+            gossip_msg = Message.gossip(sender_id=self.node_id, peer_states=peers_to_send)
+            if self.sign_fn:
+                self.sign_fn(gossip_msg)
+            if len(gossip_msg.to_frame()) <= 1200 or len(peers_to_send) <= 1:
+                break
+            peers_to_send.pop()
 
         for tid in selected_ids:
             addr = all_candidates[tid]
@@ -137,50 +166,62 @@ class GossipProtocol:
     async def handle_gossip_message(self, message: Message) -> None:
         """Process an incoming gossip payload and update peer table."""
         peers_data = message.payload.get("peers", [])
+        if not isinstance(peers_data, list):
+            return
         updated_nodes: list[str] = []
 
         for p_data in peers_data:
-            info_data = p_data.get("info")
-            metrics_data = p_data.get("metrics")
-            if not info_data:
-                continue
+            try:
+                if not isinstance(p_data, dict):
+                    continue
+                info_data = p_data.get("info")
+                metrics_data = p_data.get("metrics")
+                if not isinstance(info_data, dict):
+                    continue
 
-            peer_info = NodeInfo.from_dict(info_data)
-            if peer_info.node_id == self.node_id:
-                continue
+                peer_info = NodeInfo.from_dict(info_data)
+                if peer_info.node_id == self.node_id:
+                    continue
 
-            # Validate that peer public key cryptographically binds to node_id
-            if peer_info.public_key:
-                try:
-                    pub_bytes = bytes.fromhex(peer_info.public_key)
-                    expected_id = hashlib.sha1(pub_bytes).hexdigest()
-                    if expected_id != peer_info.node_id:
-                        logger.debug(
-                            "Dropping unverified public key for peer %s (hash mismatch %s)",
-                            peer_info.node_id[:8], expected_id[:8]
-                        )
+                # Validate that peer public key cryptographically binds to node_id
+                if peer_info.public_key:
+                    try:
+                        pub_bytes = bytes.fromhex(peer_info.public_key)
+                        expected_id = hashlib.sha1(pub_bytes).hexdigest()
+                        if expected_id != peer_info.node_id:
+                            logger.debug(
+                                "Dropping unverified public key for peer %s (hash mismatch %s)",
+                                peer_info.node_id[:8], expected_id[:8]
+                            )
+                            peer_info.public_key = None
+                    except Exception:
                         peer_info.public_key = None
-                except Exception:
-                    peer_info.public_key = None
 
-            # Prevent overwriting an existing verified public key
-            existing = self.peer_table.get(peer_info.node_id)
-            if existing and existing.info.public_key and existing.info.public_key != peer_info.public_key:
-                peer_info.public_key = existing.info.public_key
+                # Prevent overwriting an existing verified public key
+                existing = self.peer_table.get(peer_info.node_id)
+                if existing and existing.info.public_key and existing.info.public_key != peer_info.public_key:
+                    peer_info.public_key = existing.info.public_key
 
-            metrics = ResourceMetrics.from_dict(metrics_data) if metrics_data else None
-            is_direct = (peer_info.node_id == message.sender_id)
-            self.peer_table.update_peer(peer_info, metrics=metrics, direct_contact=is_direct)
+                metrics = ResourceMetrics.from_dict(metrics_data) if isinstance(metrics_data, dict) else None
+                is_direct = (peer_info.node_id == message.sender_id)
+                updated_peer = self.peer_table.update_peer(peer_info, metrics=metrics, direct_contact=is_direct)
+                if updated_peer is None:
+                    continue
 
-            # Also ensure Kademlia routing table knows about this peer
-            contact = Contact(
-                node_id=peer_info.node_id,
-                host=peer_info.host,
-                tcp_port=peer_info.tcp_port,
-                udp_port=peer_info.udp_port,
-            )
-            self.kademlia.routing_table.add_contact(contact)
-            updated_nodes.append(peer_info.node_id)
+                # Also ensure Kademlia routing table knows about live peers using established info
+                established_info = updated_peer.info
+                if updated_peer.health != PeerHealth.DEAD:
+                    contact = Contact(
+                        node_id=established_info.node_id,
+                        host=established_info.host,
+                        tcp_port=established_info.tcp_port,
+                        udp_port=established_info.udp_port,
+                    )
+                    self.kademlia.routing_table.add_contact(contact)
+                updated_nodes.append(established_info.node_id)
+            except Exception as e:
+                logger.debug("Skipping malformed gossip peer entry from %s: %s", message.sender_id[:8], e)
+                continue
 
         if updated_nodes:
             await self.events.emit(EVENT_GOSSIP_RECEIVED, {"sender": message.sender_id, "nodes": updated_nodes})

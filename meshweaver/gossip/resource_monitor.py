@@ -1,10 +1,11 @@
-"""Zero-dependency CPU and RAM resource monitor for Linux (edge/RPi) and Windows."""
+"""Zero-dependency CPU and RAM resource monitor for Linux (edge/RPi), macOS, and Windows."""
 
+import asyncio
 import ctypes
 import os
 import platform
-import sys
-import time
+import subprocess
+import threading
 from typing import Any
 from meshweaver.core.state import ResourceMetrics
 from meshweaver.utils.helpers import utc_now
@@ -13,30 +14,51 @@ from meshweaver.utils.helpers import utc_now
 class ResourceMonitor:
     """Collects real-time CPU and RAM metrics without external dependencies."""
 
-    def __init__(self, max_tasks: int = 8) -> None:
+    def __init__(self, max_tasks: int = 8, min_interval: float = 0.5) -> None:
         self.max_tasks = max_tasks
+        self.min_interval = min_interval
         self.os_type = platform.system()
         self._prev_cpu_times: tuple[Any, ...] | None = None
         self._prev_sample_time: float = 0.0
+        self._cached_metrics: ResourceMetrics | None = None
+        self._lock = threading.Lock()
 
-        # Prime initial CPU sample
-        self.sample(active_tasks=0)
+        # Prime initial CPU baseline without populating sample cache
+        self._get_cpu_percent(0.0)
 
     def sample(self, active_tasks: int = 0) -> ResourceMetrics:
-        """Collect current system resource usage."""
-        now = utc_now()
-        cpu_percent = self._get_cpu_percent(now)
-        total_mb, avail_mb, mem_percent = self._get_memory_info()
+        """Collect current system resource usage with interval caching."""
+        with self._lock:
+            now = utc_now()
+            if self._cached_metrics is not None and (now - self._prev_sample_time) < self.min_interval:
+                return ResourceMetrics(
+                    cpu_percent=self._cached_metrics.cpu_percent,
+                    memory_total_mb=self._cached_metrics.memory_total_mb,
+                    memory_available_mb=self._cached_metrics.memory_available_mb,
+                    memory_percent=self._cached_metrics.memory_percent,
+                    active_tasks=active_tasks,
+                    max_tasks=self.max_tasks,
+                    timestamp=now,
+                )
 
-        return ResourceMetrics(
-            cpu_percent=round(cpu_percent, 2),
-            memory_total_mb=round(total_mb, 2),
-            memory_available_mb=round(avail_mb, 2),
-            memory_percent=round(mem_percent, 2),
-            active_tasks=active_tasks,
-            max_tasks=self.max_tasks,
-            timestamp=now,
-        )
+            cpu_percent = self._get_cpu_percent(now)
+            total_mb, avail_mb, mem_percent = self._get_memory_info()
+            metrics = ResourceMetrics(
+                cpu_percent=round(cpu_percent, 2),
+                memory_total_mb=round(total_mb, 2),
+                memory_available_mb=round(avail_mb, 2),
+                memory_percent=round(mem_percent, 2),
+                active_tasks=active_tasks,
+                max_tasks=self.max_tasks,
+                timestamp=now,
+            )
+            self._cached_metrics = metrics
+            self._prev_sample_time = now
+            return metrics
+
+    async def sample_async(self, active_tasks: int = 0) -> ResourceMetrics:
+        """Asynchronously collect current system resource usage without blocking the event loop."""
+        return await asyncio.to_thread(self.sample, active_tasks)
 
     def _get_cpu_percent(self, now: float) -> float:
         """Calculate CPU percentage cross-platform."""
@@ -44,6 +66,8 @@ class ResourceMonitor:
             return self._get_linux_cpu()
         elif self.os_type == "Windows":
             return self._get_windows_cpu()
+        elif self.os_type == "Darwin":
+            return self._get_darwin_cpu()
         return 0.0
 
     def _get_linux_cpu(self) -> float:
@@ -121,8 +145,58 @@ class ResourceMonitor:
             return self._get_linux_memory()
         elif self.os_type == "Windows":
             return self._get_windows_memory()
+        elif self.os_type == "Darwin":
+            return self._get_darwin_memory()
         # Generic fallback
         return (1024.0, 512.0, 50.0)
+
+    def _get_darwin_cpu(self) -> float:
+        """Estimate CPU usage percentage on macOS via 1-minute load average."""
+        try:
+            load_1m = os.getloadavg()[0]
+            cpu_count = os.cpu_count() or 1
+            return max(0.0, min(100.0, (load_1m / cpu_count) * 100.0))
+        except Exception:
+            return 0.0
+
+    def _get_darwin_memory(self) -> tuple[float, float, float]:
+        """Query macOS memory via sysctl and vm_stat."""
+        try:
+            total_bytes_out = subprocess.check_output(
+                ["sysctl", "-n", "hw.memsize"],
+                text=True,
+                timeout=1.0,
+            ).strip()
+            total_mb = int(total_bytes_out) / (1024.0 * 1024.0)
+
+            vm_out = subprocess.check_output(["vm_stat"], text=True, timeout=1.0)
+            page_size = 4096
+            first_line = vm_out.splitlines()[0] if vm_out else ""
+            if "page size of" in first_line:
+                for token in first_line.split():
+                    if token.isdigit():
+                        page_size = int(token)
+                        break
+
+            pages: dict[str, int] = {}
+            for line in vm_out.splitlines()[1:]:
+                if ":" in line:
+                    k, v = line.split(":", 1)
+                    v = v.strip().rstrip(".")
+                    if v.isdigit():
+                        pages[k.strip()] = int(v)
+
+            avail_pages = (
+                pages.get("Pages free", 0)
+                + pages.get("Pages inactive", 0)
+                + pages.get("Pages speculative", 0)
+            )
+            avail_mb = (avail_pages * page_size) / (1024.0 * 1024.0)
+            avail_mb = min(total_mb, max(0.0, avail_mb))
+            percent = ((total_mb - avail_mb) / total_mb) * 100.0 if total_mb > 0 else 0.0
+            return (total_mb, avail_mb, percent)
+        except Exception:
+            return (1024.0, 512.0, 50.0)
 
     def _get_linux_memory(self) -> tuple[float, float, float]:
         """Parse Linux /proc/meminfo."""

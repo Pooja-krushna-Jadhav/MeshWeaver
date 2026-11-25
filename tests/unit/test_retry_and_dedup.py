@@ -42,30 +42,32 @@ async def test_node_in_flight_task_deduplication():
     cfg.network.tcp_port = 0
     cfg.network.udp_port = 0
     node = Node(cfg)
+    try:
+        execution_count = 0
 
-    execution_count = 0
+        @node.registry.register("count.work")
+        async def slow_work():
+            nonlocal execution_count
+            execution_count += 1
+            await asyncio.sleep(0.1)
+            return {"count": execution_count}
 
-    @node.registry.register("count.work")
-    async def slow_work():
-        nonlocal execution_count
-        execution_count += 1
-        await asyncio.sleep(0.1)
-        return {"count": execution_count}
+        task = Task(name="count.work")
+        msg1 = Message(sender_id="caller-1", msg_type="task_request", payload=task.to_dict())
+        msg2 = Message(sender_id="caller-2", msg_type="task_request", payload=task.to_dict())
 
-    task = Task(name="count.work")
-    msg1 = Message(sender_id="caller-1", msg_type="task_request", payload=task.to_dict())
-    msg2 = Message(sender_id="caller-2", msg_type="task_request", payload=task.to_dict())
+        # Send two identical task requests concurrently
+        resp1, resp2 = await asyncio.gather(
+            node._handle_task_request(msg1),
+            node._handle_task_request(msg2),
+        )
 
-    # Send two identical task requests concurrently
-    resp1, resp2 = await asyncio.gather(
-        node._handle_task_request(msg1),
-        node._handle_task_request(msg2),
-    )
-
-    assert resp1.msg_type == "task_response"
-    assert resp2.msg_type == "task_response"
-    assert resp1.payload["result"]["result"] == {"count": 1}
-    assert resp2.payload["result"]["result"] == {"count": 1}
-    # Underlying execution must occur exactly once
-    assert execution_count == 1
+        assert resp1.msg_type == "task_response"
+        assert resp2.msg_type == "task_response"
+        assert resp1.payload["result"]["result"] == {"count": 1}
+        assert resp2.payload["result"]["result"] == {"count": 1}
+        # Underlying execution must occur exactly once
+        assert execution_count == 1
+    finally:
+        await node.stop()
 

@@ -1,6 +1,8 @@
 """Self-signed certificate generation and SSL context helpers."""
 
+import ipaddress
 import logging
+import os
 import ssl
 from typing import Any
 
@@ -17,7 +19,12 @@ except ImportError:
     HAS_X509 = False
 
 
-def create_self_signed_cert(cert_path: str, key_path: str, common_name: str = "meshweaver.local") -> bool:
+def create_self_signed_cert(
+    cert_path: str,
+    key_path: str,
+    common_name: str = "meshweaver.local",
+    ip_addresses: list[str] | None = None,
+) -> bool:
     """Generate a self-signed TLS certificate and private key for encrypted P2P channels."""
     if not HAS_X509:
         logger.warning("cryptography library not installed; TLS certificate generation unavailable")
@@ -38,18 +45,28 @@ def create_self_signed_cert(cert_path: str, key_path: str, common_name: str = "m
         .not_valid_before(datetime.datetime.now(datetime.timezone.utc))
         .not_valid_after(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=365))
         .add_extension(
-            x509.SubjectAlternativeName([x509.DNSName("localhost"), x509.IPAddress(ipaddress_obj) for ipaddress_obj in []]),
+            x509.SubjectAlternativeName([
+                x509.DNSName("localhost"),
+                x509.DNSName(common_name),
+                *(x509.IPAddress(ipaddress.ip_address(ip)) for ip in (ip_addresses or [])),
+            ]),
             critical=False,
         )
         .sign(key, hashes.SHA256())
     )
 
-    with open(key_path, "wb") as f:
-        f.write(key.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.TraditionalOpenSSL,
-            encryption_algorithm=serialization.NoEncryption(),
-        ))
+    key_bytes = key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(key_bytes)
+    try:
+        os.chmod(key_path, 0o600)
+    except OSError:
+        pass
 
     with open(cert_path, "wb") as f:
         f.write(cert.public_bytes(serialization.Encoding.PEM))

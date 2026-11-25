@@ -6,6 +6,7 @@ import logging
 from typing import Any, Callable, Coroutine
 from meshweaver.discovery.routing_table import Contact, RoutingTable
 from meshweaver.networking.protocol import Message
+from meshweaver.utils.exceptions import ProtocolError
 from meshweaver.utils.helpers import generate_nonce, utc_now, xor_distance
 
 logger = logging.getLogger("meshweaver.kademlia")
@@ -24,12 +25,14 @@ class KademliaNode:
         udp_port: int,
         send_rpc_fn: Callable[[str, int, Message, float], Coroutine[Any, Any, Message | None]],
         k_size: int = 20,
+        alpha: int = ALPHA,
     ) -> None:
         self.local_node_id = local_node_id
         self.host = host
         self.tcp_port = tcp_port
         self.udp_port = udp_port
         self.send_rpc = send_rpc_fn
+        self.alpha = max(1, alpha)
         self.routing_table = RoutingTable(local_node_id, k_size=k_size)
         self.storage: dict[str, tuple[Any, float]] = {}  # key -> (value, stored_at)
 
@@ -48,8 +51,38 @@ class KademliaNode:
         sender_contact_data = payload.get("contact")
 
         if sender_contact_data:
-            contact = Contact.from_dict(sender_contact_data)
-            self.routing_table.add_contact(contact)
+            if not isinstance(sender_contact_data, dict):
+                return Message.error(
+                    sender_id=self.local_node_id,
+                    receiver_id=message.sender_id,
+                    code="INVALID_CONTACT",
+                    message="Malformed sender contact payload",
+                )
+            try:
+                contact = Contact.from_dict(sender_contact_data)
+            except (KeyError, TypeError, ValueError) as e:
+                return Message.error(
+                    sender_id=self.local_node_id,
+                    receiver_id=message.sender_id,
+                    code="INVALID_CONTACT",
+                    message=f"Invalid sender contact: {e}",
+                )
+            if contact.node_id != message.sender_id:
+                return Message.error(
+                    sender_id=self.local_node_id,
+                    receiver_id=message.sender_id,
+                    code="INVALID_CONTACT",
+                    message="Sender contact node_id does not match message sender_id",
+                )
+            try:
+                self.routing_table.add_contact(contact)
+            except ProtocolError as e:
+                return Message.error(
+                    sender_id=self.local_node_id,
+                    receiver_id=message.sender_id,
+                    code="INVALID_CONTACT",
+                    message=str(e),
+                )
 
         if rpc_type == "PING":
             return Message(
@@ -71,8 +104,16 @@ class KademliaNode:
             )
 
         elif rpc_type == "FIND_NODE":
-            target_id = str(payload.get("target_id"))
-            closest = self.routing_table.find_closest_contacts(target_id, count=self.routing_table.k_size)
+            target_id = str(payload.get("target_id", ""))
+            try:
+                closest = self.routing_table.find_closest_contacts(target_id, count=self.routing_table.k_size)
+            except ProtocolError as e:
+                return Message.error(
+                    sender_id=self.local_node_id,
+                    receiver_id=message.sender_id,
+                    code="INVALID_TARGET",
+                    message=str(e),
+                )
             return Message(
                 sender_id=self.local_node_id,
                 receiver_id=message.sender_id,
@@ -113,11 +154,18 @@ class KademliaNode:
             message=f"Unknown Kademlia RPC: {rpc_type}",
         )
 
+    def _evict_contact(self, node_id: str) -> None:
+        """Safely evict an unreachable contact from the routing table."""
+        try:
+            self.routing_table.remove_contact(node_id)
+        except ProtocolError:
+            pass
+
     async def ping(self, contact: Contact, timeout: float = 3.0) -> bool:
         """Send PING RPC to contact."""
         msg = Message(
             sender_id=self.local_node_id,
-            receiver_id=contact.node_id,
+            receiver_id=None if contact.is_seed else contact.node_id,
             msg_type="kad_rpc",
             payload={"rpc": "PING", "contact": self.self_contact().to_dict()},
         )
@@ -129,14 +177,24 @@ class KademliaNode:
                     real_contact = Contact.from_dict(peer_contact_data)
                     real_contact.last_seen = utc_now()
                     if contact.node_id != real_contact.node_id:
-                        self.routing_table.remove_contact(contact.node_id)
+                        self._evict_contact(contact.node_id)
                     self.routing_table.add_contact(real_contact)
-                else:
+                elif not contact.is_seed:
                     contact.last_seen = utc_now()
                     self.routing_table.add_contact(contact)
+                elif resp.sender_id:
+                    real_contact = Contact(
+                        node_id=resp.sender_id,
+                        host=contact.host,
+                        tcp_port=contact.tcp_port,
+                        udp_port=contact.udp_port,
+                        last_seen=utc_now(),
+                    )
+                    self.routing_table.add_contact(real_contact)
                 return True
         except Exception as e:
             logger.debug("PING to %s failed: %s", contact.node_id[:8], e)
+        self._evict_contact(contact.node_id)
         return False
 
     async def find_node(self, contact: Contact, target_id: str, timeout: float = 3.0) -> list[Contact]:
@@ -157,13 +215,17 @@ class KademliaNode:
                 contacts_data = resp.payload.get("contacts", [])
                 contacts: list[Contact] = []
                 for cd in contacts_data:
-                    c = Contact.from_dict(cd)
-                    if c.node_id != self.local_node_id:
-                        self.routing_table.add_contact(c)
-                        contacts.append(c)
+                    try:
+                        c = Contact.from_dict(cd)
+                        if c.node_id != self.local_node_id:
+                            self.routing_table.add_contact(c)
+                            contacts.append(c)
+                    except (KeyError, TypeError, ValueError, ProtocolError) as ce:
+                        logger.debug("Ignoring malformed contact in FIND_NODE_RESP: %s", ce)
                 return contacts
         except Exception as e:
             logger.debug("FIND_NODE to %s failed: %s", contact.node_id[:8], e)
+        self._evict_contact(contact.node_id)
         return []
 
     async def store(self, contact: Contact, key: str, value: Any, timeout: float = 3.0) -> bool:
@@ -182,7 +244,8 @@ class KademliaNode:
         try:
             resp = await self.send_rpc(contact.host, contact.tcp_port, msg, timeout)
             return resp is not None and resp.payload.get("rpc") == "STORE_ACK"
-        except Exception:
+        except Exception as e:
+            logger.debug("STORE to %s failed: %s", contact.node_id[:8], e)
             return False
 
     async def iterative_find_node(self, target_id: str) -> list[Contact]:
@@ -192,9 +255,11 @@ class KademliaNode:
         if not closest:
             return []
 
+        seen_ids: set[str] = {c.node_id for c in closest}
+
         while True:
             # Select unqueried contacts among closest
-            candidates = [c for c in closest if c.node_id not in queried][:ALPHA]
+            candidates = [c for c in closest if c.node_id not in queried][:self.alpha]
             if not candidates:
                 break
 
@@ -206,7 +271,8 @@ class KademliaNode:
             for res in results:
                 if isinstance(res, list):
                     for new_c in res:
-                        if new_c.node_id != self.local_node_id and new_c not in closest:
+                        if new_c.node_id != self.local_node_id and new_c.node_id not in seen_ids:
+                            seen_ids.add(new_c.node_id)
                             closest.append(new_c)
 
             closest.sort(key=lambda c: xor_distance(c.node_id, target_id))

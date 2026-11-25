@@ -3,6 +3,7 @@
 import asyncio
 from collections import defaultdict
 from dataclasses import dataclass, field
+import inspect
 import logging
 from typing import Any, Callable, Coroutine
 
@@ -42,6 +43,7 @@ class EventBus:
     def __init__(self) -> None:
         self._subscribers: dict[str, list[HandlerType]] = defaultdict(list)
         self._wildcard_subscribers: list[HandlerType] = []
+        self._pending_tasks: set[asyncio.Task[Any]] = set()
 
     def subscribe(self, event_name: str, handler: HandlerType) -> None:
         """Register a handler for a specific event or wildcard '*'."""
@@ -69,7 +71,7 @@ class EventBus:
         for handler in handlers:
             try:
                 res = handler(event)
-                if asyncio.iscoroutine(res):
+                if inspect.isawaitable(res):
                     await res
             except Exception as e:
                 logger.error("Error in event handler %s for event %s: %s", handler, event_name, e, exc_info=True)
@@ -78,7 +80,25 @@ class EventBus:
         """Fire-and-forget emit scheduled on the running asyncio loop."""
         try:
             loop = asyncio.get_running_loop()
-            loop.create_task(self.emit(event_name, data, source))
+            task = loop.create_task(self.emit(event_name, data, source))
+            self._pending_tasks.add(task)
+            task.add_done_callback(lambda t: self._on_task_done(t, event_name))
         except RuntimeError:
             # If no running event loop, ignore or log
             logger.debug("No running event loop to emit %s", event_name)
+
+    def _on_task_done(self, task: asyncio.Task[Any], event_name: str) -> None:
+        self._pending_tasks.discard(task)
+        if not task.cancelled():
+            exc = task.exception()
+            if exc is not None:
+                logger.error("Error in background event emit for %s: %s", event_name, exc, exc_info=exc)
+
+    async def cancel_pending(self) -> None:
+        """Cancel and await all pending background emit tasks."""
+        tasks = list(self._pending_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._pending_tasks.clear()
