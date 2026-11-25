@@ -9,6 +9,7 @@ from meshweaver.networking.framing import (
     PROTOCOL_VERSION,
     FrameFlags,
     Opcode,
+    decode_frame_bytes,
     encode_frame,
     read_frame,
 )
@@ -87,3 +88,102 @@ async def test_framing_payload_exceeds_max_size():
 
     with pytest.raises(FramingError, match="exceeds maximum allowed"):
         await read_frame(reader, max_size=512)
+
+
+@pytest.mark.asyncio
+async def test_framing_empty_eof_raises_connection_reset():
+    reader = asyncio.StreamReader()
+    reader.feed_eof()
+
+    with pytest.raises(ConnectionResetError, match="Connection closed"):
+        await read_frame(reader)
+
+
+@pytest.mark.asyncio
+async def test_framing_partial_header_eof_raises_framing_error():
+    encoded = encode_frame(Opcode.PING, b"hello")
+    reader = asyncio.StreamReader()
+    reader.feed_data(encoded[:5])
+    reader.feed_eof()
+
+    with pytest.raises(FramingError, match="Incomplete frame header"):
+        await read_frame(reader)
+
+
+@pytest.mark.asyncio
+async def test_framing_partial_payload_eof_raises_framing_error():
+    encoded = encode_frame(Opcode.PING, b"A" * 20)
+    reader = asyncio.StreamReader()
+    reader.feed_data(encoded[: 16 + 5])
+    reader.feed_eof()
+
+    with pytest.raises(FramingError, match="Incomplete payload"):
+        await read_frame(reader)
+
+
+@pytest.mark.asyncio
+async def test_framing_unsupported_version():
+    encoded = bytearray(encode_frame(Opcode.PING, b"test"))
+    encoded[4] = 99
+
+    reader = asyncio.StreamReader()
+    reader.feed_data(bytes(encoded))
+    reader.feed_eof()
+
+    with pytest.raises(FramingError, match="Unsupported protocol version"):
+        await read_frame(reader)
+
+
+@pytest.mark.asyncio
+async def test_framing_zero_length_payload():
+    encoded = encode_frame(Opcode.HEARTBEAT, b"")
+    reader = asyncio.StreamReader()
+    reader.feed_data(encoded)
+    reader.feed_eof()
+
+    frame = await read_frame(reader)
+    assert frame.opcode == Opcode.HEARTBEAT
+    assert frame.payload == b""
+
+
+@pytest.mark.asyncio
+async def test_framing_unknown_opcode_raises_framing_error():
+    encoded = encode_frame(250, b"payload")
+
+    with pytest.raises(FramingError, match="Unknown frame opcode"):
+        decode_frame_bytes(encoded)
+
+    reader = asyncio.StreamReader()
+    reader.feed_data(encoded)
+    reader.feed_eof()
+
+    with pytest.raises(FramingError, match="Unknown frame opcode"):
+        await read_frame(reader)
+
+
+def test_encode_frame_max_size_check():
+    with pytest.raises(FramingError, match="exceeds maximum allowed"):
+        encode_frame(Opcode.PING, b"X" * 100, max_size=64)
+
+
+@pytest.mark.asyncio
+async def test_framing_byte_by_byte_fragmented_stream_read():
+    payload = b'{"fragmented": true, "count": 12345}'
+    encoded = encode_frame(Opcode.TASK_REQUEST, payload, flags=FrameFlags.JSON)
+
+    reader = asyncio.StreamReader()
+
+    async def drip_feed():
+        for i in range(len(encoded)):
+            reader.feed_data(encoded[i : i + 1])
+            await asyncio.sleep(0)
+        reader.feed_eof()
+
+    feeder = asyncio.create_task(drip_feed())
+    try:
+        frame = await read_frame(reader)
+        assert frame.opcode == Opcode.TASK_REQUEST
+        assert frame.flags == FrameFlags.JSON
+        assert frame.payload == payload
+    finally:
+        await feeder
