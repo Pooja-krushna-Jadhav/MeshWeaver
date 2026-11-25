@@ -3,6 +3,9 @@
 from meshweaver.core.config import NodeConfig
 from meshweaver.core.node import Node
 from meshweaver.core.state import NodeInfo, NodeStatus, PeerHealth, PeerState, ResourceMetrics
+from meshweaver.execution.results import TaskResult
+from meshweaver.execution.serialization import serialize_callable
+from meshweaver.execution.task import Task, TaskPriority, TaskState, TaskType
 from meshweaver.networking.framing import Frame, Opcode
 from meshweaver.networking.protocol import Message
 from meshweaver.utils.exceptions import (
@@ -23,6 +26,12 @@ __all__ = [
     "PeerState",
     "PeerHealth",
     "ResourceMetrics",
+    "Task",
+    "TaskState",
+    "TaskPriority",
+    "TaskType",
+    "TaskResult",
+    "serialize_callable",
     "Message",
     "Frame",
     "Opcode",
