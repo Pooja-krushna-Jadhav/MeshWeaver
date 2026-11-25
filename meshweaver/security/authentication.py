@@ -39,10 +39,27 @@ class KeyManager:
                 self._ed25519_pub = self._ed25519_priv.public_key()
 
     @property
+    def has_signing_key(self) -> bool:
+        """Return True if a signing key or shared secret is configured."""
+        return self.shared_secret is not None or self._ed25519_priv is not None
+
+    @property
+    def private_key_pem(self) -> str | None:
+        """Export Ed25519 private key as PKCS8 unencrypted PEM string, or None."""
+        if self._ed25519_priv is None:
+            return None
+        pem_bytes = self._ed25519_priv.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        return pem_bytes.decode("utf-8")
+
+    @property
     def public_key_hex(self) -> str:
-        """Export public key as hex string."""
+        """Export public key as hex string, or 'hmac' in shared-secret mode."""
         if self.shared_secret:
-            return hashlib.sha256(self.shared_secret).hexdigest()
+            return "hmac"
         elif self._ed25519_pub is not None:
             raw_bytes = self._ed25519_pub.public_bytes(
                 encoding=serialization.Encoding.Raw,
@@ -68,7 +85,7 @@ class KeyManager:
             if self.shared_secret:
                 expected = hmac.new(self.shared_secret, data, hashlib.sha256).digest()
                 return hmac.compare_digest(sig_bytes, expected)
-            elif self._ed25519_pub is not None and public_key_hex:
+            elif HAS_CRYPTOGRAPHY and public_key_hex:
                 pub_bytes = bytes.fromhex(public_key_hex)
                 peer_pub_key = ed25519.Ed25519PublicKey.from_public_bytes(pub_bytes)
                 peer_pub_key.verify(sig_bytes, data)
@@ -108,24 +125,39 @@ class KeyManager:
 class ReplayProtector:
     """Detects and rejects replayed messages based on timestamp drift and nonce tracking."""
 
-    def __init__(self, window_sec: float = 30.0) -> None:
+    def __init__(self, window_sec: float = 30.0, max_entries: int = 10000) -> None:
         self.window_sec = window_sec
+        self.max_entries = max_entries
         # nonce -> seen_timestamp
         self._seen_nonces: dict[str, float] = {}
 
-    def validate(self, message: Message) -> None:
-        """Validate timestamp window and nonce uniqueness. Raises ReplayAttackError on violation."""
-        now = utc_now()
+    def _check_timestamp_at(self, message: Message, now: float) -> None:
         drift = abs(now - message.timestamp)
         if drift > self.window_sec:
             raise ReplayAttackError(
                 f"Message timestamp drift {drift:.2f}s exceeds allowable window {self.window_sec}s"
             )
 
+    def check_timestamp(self, message: Message) -> None:
+        """Validate timestamp drift without recording nonce. Raises ReplayAttackError on violation."""
+        self._check_timestamp_at(message, utc_now())
+
+    def validate(self, message: Message) -> None:
+        """Validate timestamp window and nonce uniqueness. Raises ReplayAttackError on violation."""
+        now = utc_now()
+        self._check_timestamp_at(message, now)
+
         self._cleanup(now)
 
         if message.nonce in self._seen_nonces:
             raise ReplayAttackError(f"Duplicate nonce detected: {message.nonce}")
+
+        if self.max_entries <= 0:
+            return
+
+        while len(self._seen_nonces) >= self.max_entries:
+            oldest_nonce = next(iter(self._seen_nonces))
+            del self._seen_nonces[oldest_nonce]
 
         self._seen_nonces[message.nonce] = now
 
