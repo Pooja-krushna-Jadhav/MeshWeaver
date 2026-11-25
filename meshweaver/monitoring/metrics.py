@@ -2,7 +2,6 @@
 
 import collections
 from dataclasses import dataclass, field
-import time
 from typing import Any
 from meshweaver.core.events import Event, EventBus
 from meshweaver.utils.helpers import utc_now
@@ -42,6 +41,10 @@ class MetricsCollector:
     def _subscribe_events(self) -> None:
         self.events.subscribe("*", self._on_any_event)
 
+    def stop(self) -> None:
+        """Unsubscribe from the event bus."""
+        self.events.unsubscribe("*", self._on_any_event)
+
     def _on_any_event(self, event: Event) -> None:
         now = utc_now()
         name = event.name
@@ -49,22 +52,22 @@ class MetricsCollector:
 
         if name == "task.created":
             self.tasks_submitted += 1
-            summary = f"Task created: {event.data.get('name', 'unnamed')}"
+            summary = f"Task created: {event.data.get('name') or 'unnamed'}"
         elif name == "task.completed":
             self.tasks_completed += 1
-            summary = f"Task {event.data.get('task_id', '')[:8]} completed"
+            summary = f"Task {(event.data.get('task_id') or '')[:8]} completed"
         elif name == "task.failed":
             self.tasks_failed += 1
-            summary = f"Task {event.data.get('task_id', '')[:8]} failed: {event.data.get('error', '')[:30]}"
+            summary = f"Task {(event.data.get('task_id') or '')[:8]} failed: {(event.data.get('error') or '')[:30]}"
         elif name == "task.retried":
             self.tasks_retried += 1
-            summary = f"Task {event.data.get('task_id', '')[:8]} retry #{event.data.get('attempt', 1)}"
+            summary = f"Task {(event.data.get('task_id') or '')[:8]} retry #{event.data.get('attempt', 1)}"
         elif name == "peer.connected":
-            summary = f"Peer connected: {event.data.get('node_id', '')[:8]}"
+            summary = f"Peer connected: {(event.data.get('node_id') or '')[:8]}"
         elif name == "heartbeat.lost":
-            summary = f"Peer LOST heartbeat: {event.data.get('node_id', '')[:8]}"
+            summary = f"Peer LOST heartbeat: {(event.data.get('node_id') or '')[:8]}"
         elif name == "gossip.received":
-            summary = f"Gossip update from {event.data.get('sender', '')[:8]}"
+            summary = f"Gossip update from {(event.data.get('sender') or '')[:8]}"
         else:
             summary = f"Event: {name}"
 

@@ -70,6 +70,9 @@ class HeartbeatMonitor:
         if not peers:
             return
 
+        for p in peers:
+            self.failure_detector.register_peer(p.info.node_id)
+
         tasks = [self._probe_single_peer(p.info.node_id, p.info.host, p.info.tcp_port) for p in peers]
         await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -80,7 +83,7 @@ class HeartbeatMonitor:
 
         try:
             resp = await self.send_fn(host, port, msg, self.interval)
-            if resp:
+            if resp is not None and resp.msg_type != "error":
                 rtt_ms = (utc_now() - start_t) * 1000.0
                 self.failure_detector.record_heartbeat(peer_id)
                 if peer_state:

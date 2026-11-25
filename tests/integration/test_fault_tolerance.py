@@ -145,3 +145,87 @@ async def test_caller_receives_recovered_result_on_worker_connection_drop():
     finally:
         await node_a.stop()
         await node_c.stop()
+
+
+@pytest.mark.asyncio
+async def test_organic_heartbeat_recovery_on_stalled_worker_without_duplicate_execution():
+    """Organic integration test: HeartbeatMonitor + RecoveryManager detect a stalled worker
+    during an in-flight submit_task call, cancel the hung RPC, and return the single
+    recovered TaskResult from the healthy backup worker without duplicate execution."""
+    cfg_a = NodeConfig(name="organic-submitter")
+    cfg_a.network.tcp_port = 0
+    cfg_a.network.udp_port = 0
+    node_a = Node(cfg_a)
+    node_a.heartbeat.interval = 0.05
+    node_a.failure_detector.dead_misses = 3
+    node_a.recovery.retry_policy.initial_delay = 0.05
+    node_a.resource_monitor.sample = lambda active_tasks=0: ResourceMetrics(
+        cpu_percent=95.0, memory_percent=90.0, active_tasks=active_tasks, max_tasks=8, timestamp=100.0
+    )
+
+    cfg_b = NodeConfig(name="stalled-worker-b")
+    cfg_b.network.tcp_port = 0
+    cfg_b.network.udp_port = 0
+    node_b = Node(cfg_b)
+
+    cfg_c = NodeConfig(name="healthy-worker-c")
+    cfg_c.network.tcp_port = 0
+    cfg_c.network.udp_port = 0
+    node_c = Node(cfg_c)
+
+    b_started = asyncio.Event()
+    b_release = asyncio.Event()
+    b_exec_count = 0
+    c_exec_count = 0
+
+    @node_b.registry.register("work.organic")
+    async def work_b(val: int) -> dict:
+        nonlocal b_exec_count
+        b_exec_count += 1
+        b_started.set()
+        await b_release.wait()
+        return {"worker": "b", "val": val}
+
+    @node_c.registry.register("work.organic")
+    async def work_c(val: int) -> dict:
+        nonlocal c_exec_count
+        c_exec_count += 1
+        return {"worker": "c", "val": val * 2}
+
+    # Wrap node_b's TCP handler so once the task stalls on node_b, heartbeats fail with error
+    # while the in-flight task_request TCP connection remains stalled open.
+    from meshweaver.networking.protocol import Message
+    orig_b_handler = node_b._handle_tcp_message
+
+    async def degraded_b_handler(message: Message, writer: asyncio.StreamWriter) -> Message | None:
+        if message.msg_type == "heartbeat" and b_started.is_set():
+            return Message.error(sender_id=node_b.node_id, receiver_id=message.sender_id, code="UNHEALTHY", message="stalled")
+        return await orig_b_handler(message, writer)
+
+    node_b.tcp_server.handler = degraded_b_handler
+
+    await asyncio.gather(node_a.start(), node_b.start(), node_c.start())
+
+    try:
+        # Prefer Worker B initially (lowest CPU)
+        node_a.peer_table.update_peer(
+            node_b.info,
+            metrics=ResourceMetrics(cpu_percent=5.0, memory_percent=10.0, timestamp=100.0),
+        )
+        node_a.peer_table.update_peer(
+            node_c.info,
+            metrics=ResourceMetrics(cpu_percent=30.0, memory_percent=20.0, timestamp=100.0),
+        )
+
+        task = Task(name="work.organic", payload={"args": [21]}, timeout=5.0, max_retries=2)
+        result = await asyncio.wait_for(node_a.submit_task(task), timeout=5.0)
+
+        assert result.is_success
+        assert result.worker_node_id == node_c.node_id
+        assert result.result == {"worker": "c", "val": 42}
+        assert task.state == TaskState.COMPLETED
+        assert b_exec_count == 1
+        assert c_exec_count == 1
+    finally:
+        b_release.set()
+        await asyncio.gather(node_a.stop(), node_b.stop(), node_c.stop())

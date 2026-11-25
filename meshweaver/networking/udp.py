@@ -4,9 +4,9 @@ import asyncio
 import logging
 import socket
 from typing import Any, Callable, Coroutine
-from meshweaver.networking.framing import Frame, FrameFlags, encode_frame
+from meshweaver.networking.framing import decode_frame_bytes
 from meshweaver.networking.protocol import Message
-from meshweaver.utils.exceptions import NetworkError
+from meshweaver.utils.exceptions import FramingError, NetworkError
 
 logger = logging.getLogger("meshweaver.udp")
 
@@ -42,6 +42,7 @@ class AsyncUDPEndpoint:
         broadcast: bool = False,
         max_queue_size: int = 2000,
         worker_count: int = 4,
+        max_datagram_size: int = 65507,
     ) -> None:
         self.host = host
         self.port = port
@@ -49,6 +50,7 @@ class AsyncUDPEndpoint:
         self.broadcast = broadcast
         self.max_queue_size = max_queue_size
         self.worker_count = worker_count
+        self.max_datagram_size = max_datagram_size
         self._queue: asyncio.Queue[tuple[Message, tuple[str, int]]] | None = None
         self._worker_tasks: list[asyncio.Task] = []
         self._transport: asyncio.DatagramTransport | None = None
@@ -74,21 +76,25 @@ class AsyncUDPEndpoint:
 
         loop = asyncio.get_running_loop()
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setblocking(False)
+        try:
+            sock.setblocking(False)
 
-        # Allow port reuse if supported
-        if hasattr(socket, "SO_REUSEADDR"):
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            # Allow port reuse if supported
+            if hasattr(socket, "SO_REUSEADDR"):
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
-        if self.broadcast:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            if self.broadcast:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
 
-        sock.bind((self.host, self.port))
+            sock.bind((self.host, self.port))
 
-        transport, protocol = await loop.create_datagram_endpoint(
-            lambda: _UDPProtocol(self),
-            sock=sock,
-        )
+            transport, protocol = await loop.create_datagram_endpoint(
+                lambda: _UDPProtocol(self),
+                sock=sock,
+            )
+        except Exception:
+            sock.close()
+            raise
         self._transport = transport
         self._protocol = protocol
         self._is_running = True
@@ -122,23 +128,8 @@ class AsyncUDPEndpoint:
             return
 
         try:
-            # Datagrams may be encoded as complete frames or raw message JSON
-            if data.startswith(b"MSHW") and len(data) >= 16:
-                # Decoded frame from bytes
-                from meshweaver.networking.framing import HEADER_FORMAT
-                import struct, zlib
-                _, _, op_val, flags, length, chk = struct.unpack(HEADER_FORMAT, data[:16])
-                # Validate packet contains full advertised payload length
-                if len(data) < 16 + length:
-                    logger.debug("Received truncated UDP frame from %s (got %d bytes, expected %d)", addr, len(data), 16 + length)
-                    return
-                payload = data[16 : 16 + length]
-                if (zlib.crc32(payload) & 0xFFFFFFFF) == chk:
-                    message = Message.from_bytes(payload)
-                else:
-                    return
-            else:
-                message = Message.from_bytes(data)
+            frame = decode_frame_bytes(data, max_size=self.max_datagram_size)
+            message = Message.from_frame(frame)
 
             try:
                 self._queue.put_nowait((message, addr))
@@ -159,6 +150,10 @@ class AsyncUDPEndpoint:
 
     def send_to(self, data: bytes, addr: tuple[str, int]) -> None:
         """Send raw bytes to a target UDP address."""
+        if len(data) > self.max_datagram_size:
+            raise FramingError(
+                f"UDP datagram size {len(data)} exceeds maximum allowed {self.max_datagram_size} bytes"
+            )
         if self._transport and not self._transport.is_closing():
             self._transport.sendto(data, addr)
         else:
@@ -181,5 +176,6 @@ class AsyncUDPEndpoint:
             self._transport.close()
             self._transport = None
             self._protocol = None
+            await asyncio.sleep(0)
         self._queue = None
         logger.info("UDP endpoint stopped.")

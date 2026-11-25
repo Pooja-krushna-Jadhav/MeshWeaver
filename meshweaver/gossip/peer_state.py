@@ -11,8 +11,18 @@ logger = logging.getLogger("meshweaver.peer_state")
 class PeerTable:
     """Thread-safe / async-friendly table of known peers and their live metrics."""
 
-    def __init__(self) -> None:
+    _DEFAULT_MAX_TOMBSTONES = 10000
+    _DEFAULT_TOMBSTONE_MAX_AGE = 3600.0
+
+    def __init__(
+        self,
+        max_tombstones: int = _DEFAULT_MAX_TOMBSTONES,
+        tombstone_max_age: float = _DEFAULT_TOMBSTONE_MAX_AGE,
+    ) -> None:
         self._peers: dict[str, PeerState] = {}
+        self._tombstones: dict[str, float] = {}
+        self._max_tombstones = max(1, max_tombstones)
+        self._tombstone_max_age = max(0.0, tombstone_max_age)
 
     def __len__(self) -> int:
         return len(self._peers)
@@ -29,22 +39,37 @@ class PeerTable:
         metrics: ResourceMetrics | None = None,
         rtt_ms: float | None = None,
         direct_contact: bool = True,
-    ) -> PeerState:
+    ) -> PeerState | None:
         """Add or update a peer entry with latest metrics."""
-        now = utc_now()
+        tombstone_ts = self._tombstones.get(info.node_id)
+        if tombstone_ts is not None:
+            metrics_ts = metrics.timestamp if metrics else 0.0
+            if not direct_contact and metrics_ts <= tombstone_ts:
+                return None
+            self._tombstones.pop(info.node_id, None)
+
         peer = self._peers.get(info.node_id)
         if not peer:
             peer = PeerState(info=info, metrics=metrics if metrics else ResourceMetrics())
             self._peers[info.node_id] = peer
-        elif metrics:
-            # Only update metrics if they are newer than what we have
-            if metrics.timestamp >= peer.metrics.timestamp:
+        else:
+            if metrics and metrics.timestamp >= peer.metrics.timestamp:
                 peer.metrics = metrics
+            if direct_contact:
+                peer.info = info
 
-        peer.info = info
         if direct_contact:
             peer.mark_alive(rtt_ms=rtt_ms)
         return peer
+
+    def _prune_tombstones(self, now: float) -> None:
+        """Evict expired tombstones and cap size at _max_tombstones."""
+        expired = [nid for nid, ts in self._tombstones.items() if now - ts > self._tombstone_max_age]
+        for nid in expired:
+            del self._tombstones[nid]
+        while len(self._tombstones) > self._max_tombstones:
+            oldest_id = next(iter(self._tombstones))
+            del self._tombstones[oldest_id]
 
     def check_stale(
         self,
@@ -64,6 +89,8 @@ class PeerTable:
             if elapsed >= purge_threshold:
                 purged.append(node_id)
                 del self._peers[node_id]
+                self._tombstones.pop(node_id, None)
+                self._tombstones[node_id] = now
                 logger.info("Purged expired peer %s (unseen for %.1fs)", node_id[:8], elapsed)
             elif elapsed >= dead_threshold:
                 if peer.health != PeerHealth.DEAD:
@@ -76,6 +103,7 @@ class PeerTable:
                     suspected.append(node_id)
                     logger.info("Peer %s marked SUSPECT (unseen for %.1fs)", node_id[:8], elapsed)
 
+        self._prune_tombstones(now)
         return (suspected, dead, purged)
 
     def available_peers(self) -> list[PeerState]:

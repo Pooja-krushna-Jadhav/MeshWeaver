@@ -1,15 +1,21 @@
 """Asynchronous task execution engine and registry."""
 
 import asyncio
+import importlib
 import inspect
 import logging
+import multiprocessing
+import os
+import threading
+import time
 import traceback
+import types
 from typing import Any, Callable
 from meshweaver.execution.results import TaskResult
 from meshweaver.execution.serialization import deserialize_callable
 from meshweaver.execution.task import Task, TaskState, TaskType
 from meshweaver.utils.exceptions import SecurityError, TaskExecutionError, TaskTimeoutError
-from meshweaver.utils.helpers import utc_now
+from meshweaver.utils.helpers import json_dumps, json_loads, utc_now
 
 logger = logging.getLogger("meshweaver.executor")
 
@@ -19,6 +25,7 @@ class TaskRegistry:
 
     def __init__(self) -> None:
         self._handlers: dict[str, Callable[..., Any]] = {}
+        self._builtin_handlers: dict[str, Callable[..., Any]] = {}
         # Register standard built-in edge computing tasks
         self._register_builtins()
 
@@ -34,6 +41,12 @@ class TaskRegistry:
 
     def get(self, name: str) -> Callable[..., Any] | None:
         return self._handlers.get(name)
+
+    def is_builtin(self, name: str, fn: Callable[..., Any] | None = None) -> bool:
+        builtin = self._builtin_handlers.get(name)
+        if builtin is None:
+            return False
+        return fn is None or fn is builtin
 
     def list_tasks(self) -> list[str]:
         return sorted(list(self._handlers.keys()))
@@ -59,11 +72,45 @@ class TaskRegistry:
                 counts[w] = counts.get(w, 0) + 1
             return counts
 
-        self.register("system.ping", ping)
-        self.register("math.add", add)
-        self.register("math.multiply", multiply)
-        self.register("math.vector_norm", vector_norm)
-        self.register("text.word_count", word_count)
+        for builtin_name, builtin_fn in (
+            ("system.ping", ping),
+            ("math.add", add),
+            ("math.multiply", multiply),
+            ("math.vector_norm", vector_norm),
+            ("text.word_count", word_count),
+        ):
+            self.register(builtin_name, builtin_fn)
+            self._builtin_handlers[builtin_name] = builtin_fn
+
+
+def _get_import_path(fn: Callable[..., Any]) -> tuple[str, str] | None:
+    """Return (module, qualname) if fn is top-level importable, else None."""
+    self_obj = getattr(fn, "__self__", None)
+    if self_obj is not None and not isinstance(self_obj, types.ModuleType):
+        return None
+    mod = getattr(fn, "__module__", None)
+    qualname = getattr(fn, "__qualname__", None)
+    if mod and qualname and "<locals>" not in qualname:
+        return (mod, qualname)
+    return None
+
+
+def _resolve_import_path(fn_import_path: tuple[str, str]) -> Callable[..., Any]:
+    """Import and resolve a top-level callable from (module, qualname)."""
+    mod_name, qualname = fn_import_path
+    if "<locals>" in qualname:
+        raise TaskExecutionError(f"Cannot import local function '{qualname}' in isolated worker")
+    obj: Any = importlib.import_module(mod_name)
+    for attr in qualname.split("."):
+        obj = getattr(obj, attr)
+    if not callable(obj):
+        raise TaskExecutionError(f"Imported object '{mod_name}.{qualname}' is not callable")
+    return obj
+
+
+def _send_worker_result(pipe_conn: Any, success: bool, payload: Any) -> None:
+    """Serialize worker result strictly as JSON UTF-8 bytes over the pipe."""
+    pipe_conn.send_bytes(json_dumps([success, payload]).encode("utf-8"))
 
 
 def _isolated_worker_entry(
@@ -72,28 +119,41 @@ def _isolated_worker_entry(
     fn_name: str | None,
     args: list[Any],
     kwargs: dict[str, Any],
+    fn_import_path: tuple[str, str] | None = None,
 ) -> None:
     """Entry point executed inside an isolated worker subprocess."""
     try:
+        # Scrub sensitive MeshWeaver configuration/secret env vars before executing task code
+        for key in [k for k in os.environ if k.startswith("MESHWEAVER_")]:
+            os.environ.pop(key, None)
+
         if fn_b64:
-            from meshweaver.execution.serialization import deserialize_callable
             fn = deserialize_callable(fn_b64)
+        elif fn_import_path:
+            fn = _resolve_import_path(fn_import_path)
         elif fn_name:
             reg = TaskRegistry()
             fn = reg.get(fn_name)
             if not fn:
-                pipe_conn.send((False, ("TaskExecutionError", f"Task handler '{fn_name}' not found in registry")))
+                _send_worker_result(
+                    pipe_conn,
+                    False,
+                    ["TaskExecutionError", f"Task handler '{fn_name}' not found in registry"],
+                )
                 return
         else:
-            pipe_conn.send((False, ("TaskExecutionError", "No executable payload provided")))
+            _send_worker_result(pipe_conn, False, ["TaskExecutionError", "No executable payload provided"])
             return
 
         res = fn(*args, **kwargs)
         if inspect.iscoroutine(res):
             res = asyncio.run(res)
-        pipe_conn.send((True, res))
+        _send_worker_result(pipe_conn, True, res)
     except Exception as e:
-        pipe_conn.send((False, (type(e).__name__, str(e))))
+        try:
+            _send_worker_result(pipe_conn, False, [type(e).__name__, str(e)])
+        except Exception:
+            pass
     finally:
         try:
             pipe_conn.close()
@@ -131,11 +191,11 @@ class TaskExecutor:
             task.transition_to(TaskState.ASSIGNED, reason=f"Assigned to {self.node_id[:8]}")
 
         async with self._semaphore:
-            self._active_tasks[task.task_id] = task
             task.transition_to(TaskState.RUNNING, reason="Execution started")
             logger.info("Executing task %s (%s) on node %s", task.task_id[:8], task.name, self.node_id[:8])
 
             try:
+                self._active_tasks[task.task_id] = task
                 # Execute with strict timeout
                 result_val = await asyncio.wait_for(
                     self._run_task_payload(task),
@@ -192,55 +252,65 @@ class TaskExecutor:
         args: list[Any] | None = None,
         kwargs: dict[str, Any] | None = None,
         timeout: float = 60.0,
+        fn_import_path: tuple[str, str] | None = None,
     ) -> Any:
-        import multiprocessing
         args = args or []
         kwargs = kwargs or {}
 
-        parent_conn, child_conn = multiprocessing.Pipe()
-        p = multiprocessing.Process(
+        ctx = multiprocessing.get_context("spawn")
+        parent_conn, child_conn = ctx.Pipe()
+        p = ctx.Process(
             target=_isolated_worker_entry,
-            args=(child_conn, fn_b64, fn_name, args, kwargs),
+            args=(child_conn, fn_b64, fn_name, args, kwargs, fn_import_path),
         )
         p.daemon = True
         p.start()
         child_conn.close()
 
-        loop = asyncio.get_running_loop()
+        stop_event = threading.Event()
 
         def _poll_conn() -> Any:
-            if parent_conn.poll(timeout + 1.0):
-                try:
-                    success, val = parent_conn.recv()
+            deadline = time.monotonic() + timeout
+            while not stop_event.is_set():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError()
+                if parent_conn.poll(min(0.05, remaining)):
+                    try:
+                        raw = parent_conn.recv_bytes()
+                    except EOFError:
+                        raise TaskExecutionError("Worker process closed connection unexpectedly")
+                    try:
+                        decoded = json_loads(raw)
+                        success, val = decoded
+                    except Exception as e:
+                        raise TaskExecutionError(f"Malformed worker response: {e}") from e
                     if success:
                         return val
-                    exc_type, exc_msg = val
-                    raise TaskExecutionError(f"{exc_type}: {exc_msg}")
-                except EOFError:
-                    raise TaskExecutionError("Worker process closed connection unexpectedly")
-            raise TimeoutError()
+                    if isinstance(val, (list, tuple)) and len(val) == 2:
+                        exc_type, exc_msg = val
+                        raise TaskExecutionError(f"{exc_type}: {exc_msg}")
+                    raise TaskExecutionError(f"Worker execution failed: {val}")
+            raise asyncio.CancelledError()
 
         try:
-            return await asyncio.wait_for(
-                loop.run_in_executor(None, _poll_conn),
-                timeout=timeout,
-            )
-        except (asyncio.TimeoutError, TimeoutError):
-            if p.is_alive():
-                p.terminate()
-                p.join(timeout=0.5)
-                if p.is_alive():
-                    p.kill()
-                    p.join(timeout=0.5)
+            return await asyncio.to_thread(_poll_conn)
+        except TimeoutError:
             raise TaskTimeoutError(f"Task exceeded timeout limit of {timeout}s (worker process terminated)")
         finally:
+            stop_event.set()
             try:
-                parent_conn.close()
-            except Exception:
-                pass
-            if p.is_alive():
-                p.terminate()
-                p.join(timeout=0.2)
+                if p.is_alive():
+                    p.terminate()
+                    await asyncio.to_thread(p.join, 0.5)
+                    if p.is_alive():
+                        p.kill()
+                await asyncio.to_thread(p.join, 1.0)
+            finally:
+                try:
+                    parent_conn.close()
+                except Exception:
+                    pass
 
     async def _run_task_payload(self, task: Task) -> Any:
         args = task.payload.get("args", [])
@@ -252,10 +322,33 @@ class TaskExecutor:
             if not handler:
                 raise TaskExecutionError(f"Task handler '{task.name}' not found in registry")
 
+            fn_import_path = _get_import_path(handler)
             if inspect.iscoroutinefunction(handler):
+                if isolate:
+                    if fn_import_path:
+                        return await self._run_in_process(
+                            fn_name=task.name,
+                            args=args,
+                            kwargs=kwargs,
+                            timeout=task.timeout,
+                            fn_import_path=fn_import_path,
+                        )
+                    raise TaskExecutionError(
+                        f"Async handler '{task.name}' cannot run with process_isolation=True unless top-level importable"
+                    )
                 return await handler(*args, **kwargs)
             elif isolate:
-                return await self._run_in_process(fn_name=task.name, args=args, kwargs=kwargs, timeout=task.timeout)
+                if not fn_import_path and not self.registry.is_builtin(task.name, handler):
+                    raise TaskExecutionError(
+                        f"Task handler '{task.name}' cannot run with process_isolation=True because it is not a top-level importable function"
+                    )
+                return await self._run_in_process(
+                    fn_name=task.name,
+                    args=args,
+                    kwargs=kwargs,
+                    timeout=task.timeout,
+                    fn_import_path=fn_import_path,
+                )
             else:
                 # Run sync handler in thread pool to avoid blocking asyncio event loop
                 return await asyncio.to_thread(handler, *args, **kwargs)

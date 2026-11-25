@@ -32,7 +32,7 @@ class AuthorizationPolicy:
         if task.task_type == TaskType.FUNCTION:
             if not self.allow_cloudpickle:
                 raise UnauthorizedError("Arbitrary function execution via cloudpickle is globally disabled")
-            if self.admin_nodes and sender_id not in self.admin_nodes:
+            if not self.admin_nodes or sender_id not in self.admin_nodes:
                 raise UnauthorizedError(
                     f"Node {sender_id[:8]} lacks ADMIN privilege to submit serialized functions"
                 )

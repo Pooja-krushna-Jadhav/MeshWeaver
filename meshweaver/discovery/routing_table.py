@@ -3,13 +3,23 @@
 from dataclasses import dataclass, field
 import heapq
 import logging
-from typing import Iterator
+import re
+from typing import Any, Iterator
+from meshweaver.utils.exceptions import ProtocolError
 from meshweaver.utils.helpers import node_id_to_int, utc_now, xor_distance
 
 logger = logging.getLogger("meshweaver.routing_table")
 
 K_BUCKET_SIZE = 20
 NUM_BUCKETS = 160
+_NODE_ID_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+
+
+def _validate_node_id(node_id: Any) -> str:
+    """Validate that node_id is a 40-character hexadecimal string."""
+    if not isinstance(node_id, str) or not _NODE_ID_RE.fullmatch(node_id):
+        raise ProtocolError(f"Invalid node_id: expected 40-char hex string, got {node_id!r}")
+    return node_id
 
 
 @dataclass
@@ -19,6 +29,7 @@ class Contact:
     tcp_port: int
     udp_port: int
     last_seen: float = field(default_factory=utc_now)
+    is_seed: bool = False
 
     def to_dict(self) -> dict[str, str | int | float]:
         return {
@@ -110,6 +121,7 @@ class RoutingTable:
 
     def get_bucket_index(self, node_id: str) -> int:
         """Calculate bucket index based on leading zeros of XOR distance."""
+        _validate_node_id(node_id)
         dist = xor_distance(self.local_node_id, node_id)
         if dist == 0:
             return 0
@@ -118,21 +130,25 @@ class RoutingTable:
 
     def add_contact(self, contact: Contact) -> bool:
         """Insert or refresh a contact in the appropriate k-bucket."""
+        _validate_node_id(contact.node_id)
         if contact.node_id == self.local_node_id:
             return False
         idx = self.get_bucket_index(contact.node_id)
         return self.buckets[idx].add(contact)
 
     def remove_contact(self, node_id: str) -> bool:
+        _validate_node_id(node_id)
         idx = self.get_bucket_index(node_id)
         return self.buckets[idx].remove(node_id)
 
     def get_contact(self, node_id: str) -> Contact | None:
+        _validate_node_id(node_id)
         idx = self.get_bucket_index(node_id)
         return self.buckets[idx].get_contact(node_id)
 
     def find_closest_contacts(self, target_id: str, count: int = K_BUCKET_SIZE) -> list[Contact]:
         """Return up to `count` contacts closest to `target_id` sorted by XOR distance."""
+        _validate_node_id(target_id)
         all_contacts: list[Contact] = []
         for bucket in self.buckets:
             if bucket.contacts:

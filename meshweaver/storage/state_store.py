@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+from pathlib import Path
 import sqlite3
 import threading
 from typing import Any
@@ -23,6 +24,7 @@ class StateStore:
             self._mem_conn.row_factory = sqlite3.Row
         else:
             self._mem_conn = None
+            Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
     def _get_connection(self) -> sqlite3.Connection:
@@ -30,45 +32,60 @@ class StateStore:
             return self._mem_conn
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=5000;")
+        conn.execute("PRAGMA journal_mode=WAL;")
         return conn
+
+    def close(self) -> None:
+        """Close any persistent in-memory SQLite connection."""
+        with self._lock:
+            if self._mem_conn is not None:
+                self._mem_conn.close()
+                self._mem_conn = None
+
+    async def aclose(self) -> None:
+        """Asynchronously close any persistent in-memory SQLite connection."""
+        await asyncio.to_thread(self.close)
 
     def _init_db(self) -> None:
         """Create tables if they do not exist."""
         with self._lock:
             conn = self._get_connection()
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS node_identity (
-                    node_id TEXT PRIMARY KEY,
-                    name TEXT,
-                    public_key TEXT,
-                    private_key TEXT,
-                    created_at REAL
-                )
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS tasks (
-                    task_id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    payload_json TEXT,
-                    task_type TEXT,
-                    origin_node_id TEXT,
-                    assigned_node_id TEXT,
-                    priority INTEGER,
-                    state TEXT NOT NULL,
-                    timeout REAL,
-                    retry_count INTEGER,
-                    max_retries INTEGER,
-                    result_json TEXT,
-                    error TEXT,
-                    created_at REAL,
-                    started_at REAL,
-                    completed_at REAL,
-                    execution_time_sec REAL
-                )
-            """)
-            conn.commit()
-            if self._mem_conn is None:
-                conn.close()
+            try:
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS node_identity (
+                        node_id TEXT PRIMARY KEY,
+                        name TEXT,
+                        public_key TEXT,
+                        private_key TEXT,
+                        created_at REAL
+                    )
+                """)
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS tasks (
+                        task_id TEXT PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        payload_json TEXT,
+                        task_type TEXT,
+                        origin_node_id TEXT,
+                        assigned_node_id TEXT,
+                        priority INTEGER,
+                        state TEXT NOT NULL,
+                        timeout REAL,
+                        retry_count INTEGER,
+                        max_retries INTEGER,
+                        result_json TEXT,
+                        error TEXT,
+                        created_at REAL,
+                        started_at REAL,
+                        completed_at REAL,
+                        execution_time_sec REAL
+                    )
+                """)
+                conn.commit()
+            finally:
+                if self._mem_conn is None:
+                    conn.close()
 
     async def save_task(self, task: Task) -> None:
         """Persist or update a task record asynchronously."""
@@ -86,11 +103,19 @@ class StateStore:
                         completed_at, execution_time_sec
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(task_id) DO UPDATE SET
+                        name=excluded.name,
+                        payload_json=excluded.payload_json,
+                        task_type=excluded.task_type,
+                        origin_node_id=excluded.origin_node_id,
                         assigned_node_id=excluded.assigned_node_id,
+                        priority=excluded.priority,
                         state=excluded.state,
+                        timeout=excluded.timeout,
                         retry_count=excluded.retry_count,
+                        max_retries=excluded.max_retries,
                         result_json=excluded.result_json,
                         error=excluded.error,
+                        created_at=excluded.created_at,
                         started_at=excluded.started_at,
                         completed_at=excluded.completed_at,
                         execution_time_sec=excluded.execution_time_sec
@@ -147,21 +172,37 @@ class StateStore:
                 if self._mem_conn is None:
                     conn.close()
 
+    async def list_incomplete_tasks(self) -> list[Task]:
+        """Return all non-terminal, non-failed tasks ordered by creation time ascending."""
+        return await asyncio.to_thread(self._sync_list_incomplete_tasks)
+
+    def _sync_list_incomplete_tasks(self) -> list[Task]:
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.execute(
+                    "SELECT * FROM tasks WHERE state NOT IN ('COMPLETED', 'CANCELLED', 'FAILED') ORDER BY created_at ASC"
+                )
+                return [self._row_to_task(row) for row in cur.fetchall()]
+            finally:
+                if self._mem_conn is None:
+                    conn.close()
+
     def _row_to_task(self, row: sqlite3.Row) -> Task:
-        payload = json_loads(row["payload_json"]) if row["payload_json"] else {}
-        result = json_loads(row["result_json"]) if row["result_json"] else None
+        payload = json_loads(row["payload_json"]) if row["payload_json"] is not None else {}
+        result = json_loads(row["result_json"]) if row["result_json"] is not None else None
         return Task(
             task_id=row["task_id"],
             name=row["name"],
             payload=payload,
             task_type=TaskType(row["task_type"]),
-            origin_node_id=row["origin_node_id"] or "",
+            origin_node_id=row["origin_node_id"] if row["origin_node_id"] is not None else "",
             assigned_node_id=row["assigned_node_id"],
             priority=TaskPriority(row["priority"]),
             state=TaskState(row["state"]),
-            timeout=row["timeout"] or 60.0,
-            retry_count=row["retry_count"] or 0,
-            max_retries=row["max_retries"] or 3,
+            timeout=row["timeout"] if row["timeout"] is not None else 60.0,
+            retry_count=row["retry_count"] if row["retry_count"] is not None else 0,
+            max_retries=row["max_retries"] if row["max_retries"] is not None else 3,
             created_at=row["created_at"],
             started_at=row["started_at"],
             completed_at=row["completed_at"],
@@ -177,8 +218,9 @@ class StateStore:
         with self._lock:
             conn = self._get_connection()
             try:
+                conn.execute("DELETE FROM node_identity")
                 conn.execute("""
-                    INSERT OR REPLACE INTO node_identity (node_id, name, public_key, private_key, created_at)
+                    INSERT INTO node_identity (node_id, name, public_key, private_key, created_at)
                     VALUES (?, ?, ?, ?, ?)
                 """, (node_id, name, public_key, private_key, utc_now()))
                 conn.commit()
@@ -193,7 +235,7 @@ class StateStore:
         with self._lock:
             conn = self._get_connection()
             try:
-                cur = conn.execute("SELECT * FROM node_identity LIMIT 1")
+                cur = conn.execute("SELECT * FROM node_identity ORDER BY created_at DESC LIMIT 1")
                 row = cur.fetchone()
                 if row:
                     return dict(row)

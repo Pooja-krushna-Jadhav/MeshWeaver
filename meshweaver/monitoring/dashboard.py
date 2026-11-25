@@ -46,7 +46,8 @@ class TerminalDashboard:
     def __init__(self, node: Any, refresh_interval: float = 1.0) -> None:
         self.node = node
         self.refresh_interval = refresh_interval
-        self.metrics_collector = MetricsCollector(node.events)
+        history_size = getattr(getattr(getattr(node, "config", None), "monitoring", None), "metrics_history_size", 20)
+        self.metrics_collector = MetricsCollector(node.events, max_log_history=history_size)
         self._is_running = False
         self._task: asyncio.Task | None = None
         self._console = Console() if HAS_RICH else None
@@ -68,6 +69,7 @@ class TerminalDashboard:
             except asyncio.CancelledError:
                 pass
             self._task = None
+        self.metrics_collector.stop()
 
     async def _run_loop(self) -> None:
         """Asynchronous live rendering loop."""
