@@ -56,10 +56,12 @@ class MultiMetricStrategy(SchedulingStrategy):
         cpu_weight: float = 0.5,
         ram_weight: float = 0.3,
         queue_weight: float = 0.2,
+        rtt_weight: float = 0.1,
     ) -> None:
         self.cpu_weight = cpu_weight
         self.ram_weight = ram_weight
         self.queue_weight = queue_weight
+        self.rtt_weight = rtt_weight
 
     def score(self, peer: PeerState) -> float:
         health_penalty = 100.0 if peer.health == PeerHealth.SUSPECT else 0.0
@@ -69,11 +71,13 @@ class MultiMetricStrategy(SchedulingStrategy):
             peer.metrics.active_tasks / peer.metrics.max_tasks
             if peer.metrics.max_tasks > 0 else 1.0
         )
+        rtt_ratio = min(max(peer.rtt_ms, 0.0) / 1000.0, 1.0)
         return (
             health_penalty
             + self.cpu_weight * cpu_ratio
             + self.ram_weight * ram_ratio
             + self.queue_weight * queue_ratio
+            + self.rtt_weight * rtt_ratio
         )
 
     def select_peer(
@@ -107,11 +111,12 @@ class RoundRobinStrategy(SchedulingStrategy):
     ) -> PeerState | None:
         valid = [
             p for p in candidates
-            if p.health != PeerHealth.DEAD and p.metrics.available_capacity > 0
+            if p.health != PeerHealth.DEAD and p.metrics.available_capacity > 0 and not p.metrics.is_overloaded
         ]
         if not valid:
             return None
 
+        valid.sort(key=lambda p: p.info.node_id)
         idx = self._counter % len(valid)
         self._counter += 1
         return valid[idx]
