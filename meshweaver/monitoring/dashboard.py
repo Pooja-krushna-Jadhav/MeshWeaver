@@ -87,31 +87,40 @@ class TerminalDashboard:
                 await asyncio.sleep(self.refresh_interval)
 
     def render_layout(self) -> Any:
-        """Construct the high-density Rich layout."""
+
         if not HAS_RICH:
             return "Rich not available"
 
         layout = Layout()
-        layout.split_column(
-            Layout(name="header", size=4),
-            Layout(name="body", ratio=1),
-            Layout(name="footer", size=3),
-        )
+        terminal_width = self._console.size.width
 
-        layout["body"].split_row(
-            Layout(name="left", ratio=3),
-            Layout(name="right", ratio=2),
-        )
-
-        layout["left"].split_column(
-            Layout(name="peers", ratio=1),
-            Layout(name="tasks", ratio=1),
-        )
-
-        layout["right"].split_column(
-            Layout(name="telemetry", size=13),
-            Layout(name="events", ratio=1),
-        )
+        if terminal_width < 100:
+            layout.split_column(
+                Layout(name="header", size=4),
+                Layout(name="peers", ratio=1),
+                Layout(name="tasks", ratio=1),
+                Layout(name="telemetry", size=13),
+                Layout(name="events", ratio=1),
+                Layout(name="footer", size=3),
+            )
+        else:
+            layout.split_column(
+                Layout(name="header", size=4),
+                Layout(name="body", ratio=1),
+                Layout(name="footer", size=3),
+            )
+            layout["body"].split_row(
+                Layout(name="left", ratio=3),
+                Layout(name="right", ratio=2),
+            )
+            layout["left"].split_column(
+                Layout(name="peers", ratio=1),
+                Layout(name="tasks", ratio=1),
+            )
+            layout["right"].split_column(
+                Layout(name="telemetry", size=13),
+                Layout(name="events", ratio=1),
+            )
 
         layout["header"].update(self._build_header())
         layout["peers"].update(self._build_peers_table())
@@ -121,7 +130,6 @@ class TerminalDashboard:
         layout["footer"].update(self._build_footer())
 
         return layout
-
     def _build_header(self) -> Panel:
         uptime_sec = utc_now() - self.node.info.started_at
         uptime_str = _format_time_delta(uptime_sec)
